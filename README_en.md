@@ -27,7 +27,7 @@ Designed as a drop-in replacement for [sniprun](https://github.com/michaelb/snip
 
 ```lua
 {
-  dir = "~/projects/blockrun.nvim",
+  dir = "path/blockrun.nvim",
   keys = {
     { "<leader>r",  "<Plug>SnipRun",   mode = { "n", "v" }, desc = "Run snippet" },
     { "<leader>rc", "<Plug>SnipClose",  desc = "Close output" },
@@ -41,7 +41,7 @@ Designed as a drop-in replacement for [sniprun](https://github.com/michaelb/snip
 
 ```lua
 {
-  "your-username/blockrun.nvim",
+  "wzxzhuxi/blockrun.nvim",
   keys = {
     { "<leader>r",  "<Plug>SnipRun",   mode = { "n", "v" }, desc = "Run snippet" },
     { "<leader>rc", "<Plug>SnipClose",  desc = "Close output" },
