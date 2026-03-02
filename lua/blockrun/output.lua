@@ -1,16 +1,40 @@
--- blockrun/output.lua — 浮动窗口输出显示
+-- blockrun/output.lua — 浮动窗口 + virtual text 输出显示
 
 local M = {}
 
 local state = {
   bufnr = nil,
   winid = nil,
+  virt_mark_id = nil,
+  virt_bufnr = nil,
+  virt_timer = nil,
 }
 
 local ns = vim.api.nvim_create_namespace("blockrun")
 
---- 关闭输出窗口（防重入安全）
+--- 清除 virtual text extmark
+function M.clear_virt_text()
+  local timer = state.virt_timer
+  state.virt_timer = nil
+  if timer then
+    timer:stop()
+    timer:close()
+  end
+
+  local mark_id = state.virt_mark_id
+  local bufnr = state.virt_bufnr
+  state.virt_mark_id = nil
+  state.virt_bufnr = nil
+
+  if mark_id and bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+    vim.api.nvim_buf_del_extmark(bufnr, ns, mark_id)
+  end
+end
+
+--- 关闭输出窗口 + 清除 virtual text（防重入安全）
 function M.close()
+  M.clear_virt_text()
+
   local winid = state.winid
   local bufnr = state.bufnr
   state.winid = nil
@@ -98,9 +122,19 @@ end
 
 --- 在浮动窗口中显示运行结果
 ---@param result { stdout: string, stderr: string, code: integer, signal: integer, timed_out?: boolean }
----@param config? table
-function M.show(result, config)
-  M.close()
+---@param cfg? table
+function M.show(result, cfg)
+  -- 只关闭浮动窗口部分，保留 virt_text
+  local winid = state.winid
+  local bufnr = state.bufnr
+  state.winid = nil
+  state.bufnr = nil
+  if winid and vim.api.nvim_win_is_valid(winid) then
+    vim.api.nvim_win_close(winid, true)
+  end
+  if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+    vim.api.nvim_buf_delete(bufnr, { force = true })
+  end
 
   local lines, hls = format_result(result)
   local width, height = calc_dimensions(lines)
@@ -156,6 +190,85 @@ function M.show(result, config)
       vim.schedule(M.close)
     end,
   })
+end
+
+--- 在行尾显示 virtual text
+---@param result { stdout: string, stderr: string, code: integer, signal: integer, timed_out?: boolean }
+---@param cfg table  全局 config（含 virt_text 子表）
+---@param ctx { bufnr: integer, line: integer }  bufnr + 0-indexed 行号
+function M.show_virt_text(result, cfg, ctx)
+  M.clear_virt_text()
+
+  local vt_cfg = cfg.virt_text or {}
+  local prefix = vt_cfg.prefix or "→ "
+  local hl = vt_cfg.hl or "Comment"
+  local err_hl = vt_cfg.err_hl or "DiagnosticError"
+  local clear_after = vt_cfg.clear_after or 5000
+
+  -- 决定显示内容：stderr 优先
+  local text, use_hl
+  if result.stderr and result.stderr ~= "" then
+    text = result.stderr
+    use_hl = err_hl
+  elseif result.stdout and result.stdout ~= "" then
+    text = result.stdout
+    use_hl = hl
+  elseif result.timed_out then
+    text = "[timed out]"
+    use_hl = err_hl
+  elseif result.code ~= 0 then
+    text = string.format("[exit %d]", result.code)
+    use_hl = err_hl
+  else
+    text = "(no output)"
+    use_hl = hl
+  end
+
+  -- 多行只取第一行
+  local first_line = text:match("^([^\n]*)")
+  local line_count = select(2, text:gsub("\n", "")) + 1
+  if line_count > 1 then
+    first_line = first_line .. string.format(" (+%d lines)", line_count - 1)
+  end
+
+  local display_text = prefix .. first_line
+
+  -- 确保 buffer 有效且行号在范围内
+  if not vim.api.nvim_buf_is_valid(ctx.bufnr) then return end
+  local line_count_buf = vim.api.nvim_buf_line_count(ctx.bufnr)
+  local line = math.min(ctx.line, line_count_buf - 1)
+
+  local mark_id = vim.api.nvim_buf_set_extmark(ctx.bufnr, ns, line, 0, {
+    virt_text = { { display_text, use_hl } },
+    virt_text_pos = "eol",
+  })
+
+  state.virt_mark_id = mark_id
+  state.virt_bufnr = ctx.bufnr
+
+  -- 自动清除定时器
+  if clear_after > 0 then
+    local timer = vim.uv.new_timer()
+    state.virt_timer = timer
+    timer:start(clear_after, 0, vim.schedule_wrap(function()
+      M.clear_virt_text()
+    end))
+  end
+end
+
+--- 统一显示入口 — 根据 config.display 分发到各后端
+---@param result table  运行结果
+---@param cfg table     全局 config
+---@param ctx { bufnr: integer, line: integer }  源 buffer + 0-indexed 行号
+function M.display(result, cfg, ctx)
+  local backends = cfg.display or { "float" }
+  for _, backend in ipairs(backends) do
+    if backend == "float" then
+      M.show(result, cfg)
+    elseif backend == "virt_text" then
+      M.show_virt_text(result, cfg, ctx)
+    end
+  end
 end
 
 --- 输出窗口是否可见

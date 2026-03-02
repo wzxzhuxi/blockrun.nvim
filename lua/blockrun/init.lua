@@ -8,19 +8,25 @@ local output = require("blockrun.output")
 
 ---@type table
 local config = {
-  timeout = 10, -- 超时秒数
-  langs = {},   -- 用户覆盖: { python = { cmd = "python" } }
+  timeout = 10,                -- 超时秒数
+  display = { "float" },       -- "float" | "virt_text" | 两者都有
+  virt_text = {
+    prefix = "→ ",             -- 结果前缀
+    hl = "Comment",            -- stdout 高亮组
+    err_hl = "DiagnosticError", -- stderr 高亮组
+    clear_after = 5000,        -- 自动清除延时(ms)，0=不清除
+  },
+  langs = {},                  -- 用户覆盖: { python = { cmd = "python" } }
 }
 
 --- 获取 visual 模式选中的文本（Neovim 0.11+）
----@return string
+---@return string code, integer end_line  (end_line 0-indexed)
 local function get_visual_selection()
-  local region = vim.fn.getregion(
-    vim.fn.getpos("'<"),
-    vim.fn.getpos("'>"),
-    { type = vim.fn.visualmode() }
-  )
-  return table.concat(region, "\n")
+  local start_pos = vim.fn.getpos("'<")
+  local end_pos = vim.fn.getpos("'>")
+  local region = vim.fn.getregion(start_pos, end_pos, { type = vim.fn.visualmode() })
+  local end_line = end_pos[2] - 1 -- 转 0-indexed
+  return table.concat(region, "\n"), end_line
 end
 
 --- 从 treesitter 节点范围提取文本，处理根节点 ec=0 的情况
@@ -48,7 +54,7 @@ local function get_node_text(sr, sc, er, ec)
 end
 
 --- 尝试用 treesitter 获取光标所在的代码块
----@return string?
+---@return string? text, integer? end_line  (end_line 0-indexed)
 local function get_ts_block()
   local ok, node = pcall(vim.treesitter.get_node)
   if not ok or not node then
@@ -82,7 +88,9 @@ local function get_ts_block()
       local sr, sc, er, ec = node:range()
       local text = get_node_text(sr, sc, er, ec)
       if text and text ~= "" then
-        return text
+        -- end_line: 如果 ec==0 则实际最后一行是 er-1，否则是 er
+        local end_line = (ec == 0 and er > sr) and (er - 1) or er
+        return text, end_line
       end
     end
     node = node:parent()
@@ -102,14 +110,14 @@ local fence_to_ft = {
 
 --- 查找光标所在的 markdown 围栏代码块
 --- 扫描原始行文本，正确处理嵌套围栏（如 README 中的 ````markdown 包裹）
----@return string? code, string? ft
+---@return string? code, string? ft, integer? end_line  (end_line 0-indexed)
 local function get_markdown_block()
   local cursor_row = vim.api.nvim_win_get_cursor(0)[1] -- 1 起
   local buf_lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
 
   -- 查找包含光标的最内层 3 反引号围栏
   -- 4+ 反引号的围栏（````markdown）会被跳过
-  local best_code, best_ft
+  local best_code, best_ft, best_end_line
 
   local fence_start, fence_lang
   for i, line in ipairs(buf_lines) do
@@ -128,41 +136,43 @@ local function get_markdown_block()
         local ft = fence_to_ft[fence_lang] or fence_lang
         best_code = table.concat(code_lines, "\n")
         best_ft = ft
+        best_end_line = i - 1 - 1 -- 围栏关闭行的上一行，转 0-indexed
         -- 不中断：继续扫描以找到更内层的匹配
       end
       fence_start = nil
     end
   end
 
-  return best_code, best_ft
+  return best_code, best_ft, best_end_line
 end
 
 --- 根据模式提取代码
 ---@param mode? string "v" 为 visual 模式，nil 为 normal 模式
----@return string?
+---@return string? code, integer? end_line  (end_line 0-indexed)
 local function extract_code(mode)
   if mode == "v" then
     return get_visual_selection()
   end
 
   -- Normal 模式：先尝试 treesitter 代码块，失败则取当前行
-  local block = get_ts_block()
+  local block, end_line = get_ts_block()
   if block and block ~= "" then
-    return block
+    return block, end_line
   end
 
-  return vim.api.nvim_get_current_line()
+  local cursor_line = vim.api.nvim_win_get_cursor(0)[1] - 1 -- 0-indexed
+  return vim.api.nvim_get_current_line(), cursor_line
 end
 
 --- 主运行函数
 ---@param mode? string "v" 为 visual 模式
 function M.run(mode)
   local ft = vim.bo.filetype
-  local code, spec
+  local code, spec, end_line
 
   if ft == "markdown" or ft == "markdown.mdx" then
     -- Markdown：提取围栏代码块及其语言
-    local md_code, md_ft = get_markdown_block()
+    local md_code, md_ft, md_end_line = get_markdown_block()
     if not md_code or not md_ft then
       vim.notify("[blockrun] 光标不在围栏代码块内", vim.log.levels.WARN)
       return
@@ -174,9 +184,10 @@ function M.run(mode)
     end
     -- Markdown 中 visual 模式：用选区内容，但语言从围栏检测
     if mode == "v" then
-      code = get_visual_selection()
+      code, end_line = get_visual_selection()
     else
       code = md_code
+      end_line = md_end_line
     end
   else
     spec = langs.get(ft)
@@ -184,7 +195,7 @@ function M.run(mode)
       vim.notify(string.format("[blockrun] 不支持的文件类型: %s", ft), vim.log.levels.WARN)
       return
     end
-    code = extract_code(mode)
+    code, end_line = extract_code(mode)
   end
 
   if not code or code == "" then
@@ -192,8 +203,36 @@ function M.run(mode)
     return
   end
 
+  local run_bufnr = vim.api.nvim_get_current_buf()
+  end_line = end_line or (vim.api.nvim_win_get_cursor(0)[1] - 1)
+
   runner.execute(code, spec, config, function(result)
-    output.show(result, config)
+    output.display(result, config, { bufnr = run_bufnr, line = end_line })
+  end)
+end
+
+--- Operator mode 回调 — 由 operatorfunc 调用
+---@param motion_type string  "line" | "char" | "block"
+function M.run_operator(motion_type)
+  local region_type = ({ line = "V", char = "v", block = "\22" })[motion_type]
+  local start_pos = vim.fn.getpos("'[")
+  local end_pos = vim.fn.getpos("']")
+  local lines = vim.fn.getregion(start_pos, end_pos, { type = region_type })
+  local code = table.concat(lines, "\n")
+
+  local ft = vim.bo.filetype
+  local spec = langs.get(ft)
+  if not spec then
+    vim.notify(string.format("[blockrun] 不支持的文件类型: %s", ft), vim.log.levels.WARN)
+    return
+  end
+  if code == "" then return end
+
+  local run_bufnr = vim.api.nvim_get_current_buf()
+  local end_line = end_pos[2] - 1 -- 转 0-indexed
+
+  runner.execute(code, spec, config, function(result)
+    output.display(result, config, { bufnr = run_bufnr, line = end_line })
   end)
 end
 
@@ -216,6 +255,12 @@ function M.setup(opts)
   if opts.timeout then
     config.timeout = opts.timeout
   end
+  if opts.display then
+    config.display = opts.display
+  end
+  if opts.virt_text then
+    config.virt_text = vim.tbl_deep_extend("force", config.virt_text, opts.virt_text)
+  end
 
   -- 注册用户自定义语言
   if opts.langs then
@@ -224,11 +269,20 @@ function M.setup(opts)
     end
   end
 
+  -- 全局函数供 operatorfunc 调用
+  _G._blockrun_operatorfunc = function(motion_type)
+    M.run_operator(motion_type)
+  end
+
   -- <Plug> 映射（兼容 sniprun 命名）
   vim.keymap.set("n", "<Plug>SnipRun", function() M.run() end, { desc = "运行代码块/当前行" })
   vim.keymap.set("v", "<Plug>SnipRun", function() M.run("v") end, { desc = "运行选中代码" })
   vim.keymap.set("n", "<Plug>SnipClose", function() M.close() end, { desc = "关闭输出" })
   vim.keymap.set("n", "<Plug>SnipReset", function() M.reset() end, { desc = "终止并关闭" })
+  vim.keymap.set("n", "<Plug>SnipRunOperator", function()
+    vim.o.operatorfunc = "v:lua._blockrun_operatorfunc"
+    return "g@"
+  end, { expr = true, desc = "运行 motion 覆盖的代码" })
 
   -- 用户命令
   vim.api.nvim_create_user_command("SnipRun", function(cmd_opts)
@@ -248,5 +302,11 @@ function M.setup(opts)
     )
   end, { desc = "显示支持的语言" })
 end
+
+--- 暴露 config 供 api.lua 读取
+M._config = config
+
+--- 公开 API
+M.api = require("blockrun.api")
 
 return M
