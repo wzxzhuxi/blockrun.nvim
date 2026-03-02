@@ -27,7 +27,7 @@
 
 ```lua
 {
-  dir = "~/projects/blockrun.nvim",
+  dir = "path/blockrun.nvim",
   keys = {
     { "<leader>r",  "<Plug>SnipRun",   mode = { "n", "v" }, desc = "运行代码" },
     { "<leader>rc", "<Plug>SnipClose",  desc = "关闭输出" },
@@ -41,7 +41,7 @@
 
 ```lua
 {
-  "your-username/blockrun.nvim",
+  "wzxzhuxi/blockrun.nvim",
   keys = {
     { "<leader>r",  "<Plug>SnipRun",   mode = { "n", "v" }, desc = "运行代码" },
     { "<leader>rc", "<Plug>SnipClose",  desc = "关闭输出" },
@@ -108,11 +108,9 @@ opts = {
 
 将光标放在围栏代码块内，按 `<leader>r`：
 
-````markdown
 ```python
 print("hello from markdown")
 ```
-````
 
 ### 添加自定义语言
 
